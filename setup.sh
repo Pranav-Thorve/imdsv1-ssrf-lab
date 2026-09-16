@@ -13,15 +13,57 @@ PROFILE_NAME="capone-WAF-Role"
 SG_NAME="${NAME}-waf"
 INSTANCE_NAME="capone-WAF"
 
-echo "==> identity / region"
-ID_JSON="$(aws sts get-caller-identity --output json)"
+how_to_auth() {
+  cat <<'EOF'
+
+This script does not take an AWS account ID as an argument.
+It deploys into whichever account the AWS CLI is already using.
+
+  1. Install AWS CLI v2
+  2. Use a throwaway account — not production
+  3. aws configure --profile lab
+  4. export AWS_PROFILE=lab
+  5. export AWS_REGION=us-east-1    # optional; default is us-east-1
+  6. ./setup.sh
+
+The CLI calls sts:GetCallerIdentity and creates EC2, IAM, and S3 in THAT account.
+You need a default VPC in the region and permission to create those resources.
+Skip the confirm prompt with: ASSUME_YES=1 ./setup.sh
+
+EOF
+}
+
+if ! command -v aws >/dev/null 2>&1; then
+  echo "AWS CLI v2 is required." >&2
+  how_to_auth
+  exit 1
+fi
+
+if ! ID_JSON="$(aws sts get-caller-identity --output json 2>/dev/null)"; then
+  echo "AWS CLI is not authenticated in this shell." >&2
+  how_to_auth
+  exit 1
+fi
+
 ACCOUNT="$(python3 -c "import json,sys; print(json.load(sys.stdin)['Account'])" <<<"$ID_JSON")"
 ARN="$(python3 -c "import json,sys; print(json.load(sys.stdin)['Arn'])" <<<"$ID_JSON")"
+CLI_PROFILE="${AWS_PROFILE:-default}"
+
+echo "==> will create resources in THIS identity (not passed on the command line)"
+echo "    AWS_PROFILE=$CLI_PROFILE"
 echo "    account=$ACCOUNT"
 echo "    arn=$ARN"
 echo "    region=$REGION"
 echo "    bucket=$BUCKET"
 echo "    role=$ROLE"
+
+if [[ "${ASSUME_YES:-}" != "1" ]]; then
+  read -r -p "Deploy into account $ACCOUNT ($REGION)? [y/N] " ans
+  case "$ans" in
+    y|Y|yes|YES) ;;
+    *) echo "Aborted. Set AWS_PROFILE to the throwaway account and re-run."; exit 1 ;;
+  esac
+fi
 
 AMI="$(aws ssm get-parameters \
   --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \

